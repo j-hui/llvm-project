@@ -10696,6 +10696,41 @@ void ASTReader::visitTopLevelModuleMaps(
   }
 }
 
+/// Whether RD already has an implicit member equivalent to MD, e.g., because
+/// another module added the same implicit member.
+static bool hasImplicitMember(CXXRecordDecl *RD, CXXMethodDecl *MD) {
+  if (auto *Ctor = dyn_cast<CXXConstructorDecl>(MD)) {
+    if (Ctor->isInheritingConstructor()) {
+      // Inheriting constructors are not special members, so RD does not track
+      // them. Look for one that inherits the same base class constructor.
+      const CXXConstructorDecl *BaseCtor =
+          Ctor->getInheritedConstructor().getConstructor()->getCanonicalDecl();
+      for (Decl *D : RD->noload_decls())
+        if (auto *Existing = dyn_cast<CXXConstructorDecl>(D))
+          if (Existing->isInheritingConstructor() &&
+              Existing->getInheritedConstructor()
+                      .getConstructor()
+                      ->getCanonicalDecl() == BaseCtor)
+            return true;
+      return false;
+    }
+    if (Ctor->isDefaultConstructor())
+      return !RD->needsImplicitDefaultConstructor();
+    if (Ctor->isCopyConstructor())
+      return !RD->needsImplicitCopyConstructor();
+    if (Ctor->isMoveConstructor())
+      return !RD->needsImplicitMoveConstructor();
+    return false;
+  }
+  if (isa<CXXDestructorDecl>(MD))
+    return !RD->needsImplicitDestructor();
+  if (MD->isCopyAssignmentOperator())
+    return !RD->needsImplicitCopyAssignment();
+  if (MD->isMoveAssignmentOperator())
+    return !RD->needsImplicitMoveAssignment();
+  return false;
+}
+
 void ASTReader::finishPendingActions() {
   while (!PendingIdentifierInfos.empty() ||
          !PendingDeducedFunctionTypes.empty() ||
@@ -10974,71 +11009,13 @@ void ASTReader::finishPendingActions() {
 
   // Inform any classes that had members added that they now have more members.
   for (auto [RD, MD] : PendingAddedClassMembers) {
-    // The module we just imported added MD to RD so we should do the same, but
-    // only RD doesn't already contain the same member. This can happen when two
-    // modules independent add and serialize the same implicit member.
-
-    // Fast path: we can check for the presence of implicit special members
-    // (default/copy/move constructors + copy/move assignments + destructors)
-    // with RD's needsImplicit*() methods (which are constant time).
-    if (const auto *Ctor = dyn_cast<CXXConstructorDecl>(MD)) {
-      if (!Ctor->isInheritingConstructor()) {
-        if (Ctor->isDefaultConstructor()) {
-          if (RD->needsImplicitDefaultConstructor())
-            RD->addHiddenDecl(MD);
-          continue;
-        }
-        if (Ctor->isCopyConstructor()) {
-          if (RD->needsImplicitCopyConstructor())
-            RD->addHiddenDecl(MD);
-          continue;
-        }
-        if (Ctor->isMoveConstructor()) {
-          if (RD->needsImplicitMoveConstructor())
-            RD->addHiddenDecl(MD);
-          continue;
-        }
-      }
-    } else if (const auto *Mthd = dyn_cast<CXXMethodDecl>(MD)) {
-      if (isa<CXXDestructorDecl>(Mthd)) {
-        if (RD->needsImplicitDestructor())
-          RD->addHiddenDecl(MD);
-        continue;
-      }
-      if (Mthd->isCopyAssignmentOperator()) {
-        if (RD->needsImplicitCopyAssignment())
-          RD->addHiddenDecl(MD);
-        continue;
-      }
-      if (Mthd->isMoveAssignmentOperator()) {
-        if (RD->needsImplicitMoveAssignment())
-          RD->addHiddenDecl(MD);
-        continue;
-      }
-    }
-
-    if (auto *FD = dyn_cast<FunctionDecl>(MD)) {
-      // Slow path: this is some other implicit added member (e.g., inherited
-      // constructor). We need iterate through all of RD's members and compare
-      // their ODR hash against MD's.
-      auto needToAddMD = true;
-      for (auto *RDD : RD->noload_decls()) {
-        if (auto *RDFD = dyn_cast<FunctionDecl>(RDD)) {
-          if (FD->getODRHash() == RDFD->getODRHash()) {
-            needToAddMD = false;
-            break;
-          }
-        }
-      }
-      if (needToAddMD)
-        RD->addHiddenDecl(MD);
-      continue;
-    }
-
-    // This branch is only reachable if MD is not a function decl (which means
-    // it doesn't have an ODR hash to compare). Call addedMember() to preserve
-    // historical behavior.
-    RD->addedMember(MD);
+    // ASTWriter::AddedCXXImplicitMember only records methods.
+    auto *Method = cast<CXXMethodDecl>(MD);
+    // Several modules may each add the same implicit member; add it once.
+    // Name lookup already finds Method through the module's lookup table, so
+    // only add it to RD's list of declarations.
+    if (!hasImplicitMember(RD, Method))
+      RD->addHiddenDecl(Method);
   }
   PendingAddedClassMembers.clear();
 
